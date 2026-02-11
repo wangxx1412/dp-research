@@ -146,3 +146,76 @@ public class LambdaHandler {
  * [ ] 超时设置: 整个流程（Lambda -> App Auth -> App Config -> Return）必须在 AWS Transfer Family 的超时限制（通常是 30 秒，但建议控制在 5-10 秒）内完成。
  * [ ] 网络: 确认 Lambda 出去的 IP 是否在 App API Gateway 的白名单里。
 这个设计清晰吗？如果你的 App 返回的 Policy 格式很特殊，或者需要我在代码里加一段生成 Policy JSON 的逻辑，请告诉我。
+
+清楚明确。这里是 AWS Transfer Family 调用你的 API Gateway（以及你的 Spring Boot Controller）时的标准 HTTP 契约。
+请注意：AWS Transfer Family 不会 发送 JSON Body，所有的参数都是通过 HTTP Headers 或 Query Parameters 传递的。
+1. 请求 (Request)
+方向： AWS Transfer Family Service -> API Gateway -> Your Spring Boot App
+当你在 AWS Console 配置 Custom Identity Provider 时，通常使用 GET 方法。
+HTTP 请求示例 (Raw HTTP)
+GET /api/v1/transfer/auth?username=jdoe&serverId=s-1234567890abcdef0 HTTP/1.1
+Host: api-gateway-id.execute-api.us-east-1.amazonaws.com
+User-Agent: Transfer Family
+Password: MySecretPassword123!   <-- 关键：密码在 Header 中
+Protocol: SFTP
+SourceIp: 203.0.113.5
+
+Spring Controller 映射
+为了接收上面的请求，你的 Controller 方法签名应该是这样的：
+@GetMapping("/auth")
+public ResponseEntity<Map<String, Object>> handleAuth(
+    // URL Query Parameters
+    @RequestParam("username") String username,
+    @RequestParam(value = "serverId", required = false) String serverId,
+
+    // HTTP Headers
+    @RequestHeader("Password") String password,
+    @RequestHeader(value = "Protocol", defaultValue = "SFTP") String protocol,
+    @RequestHeader(value = "SourceIp", required = false) String sourceIp
+) { ... }
+
+2. 成功响应 (Success Response)
+场景： 验证通过，OAuth Token 获取成功，App 返回了 Role 和 Policy。
+HTTP 响应示例 (Raw HTTP)
+ * Status Code: 200 OK
+ * Content-Type: application/json
+<!-- end list -->
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "Role": "arn:aws:iam::123456789012:role/SftpUserAccessRole",
+  "Policy": "{\"Version\": \"2012-10-17\",\"Statement\": [{\"Sid\": \"AllowListingOfUserFolder\",\"Action\": [\"s3:ListBucket\"],\"Effect\": \"Allow\",\"Resource\": [\"arn:aws:s3:::my-bucket\"],\"Condition\": {\"StringLike\": {\"s3:prefix\": [\"home/jdoe/*\",\"home/jdoe\"]}}},{\"Sid\": \"HomeDirObjectAccess\",\"Effect\": \"Allow\",\"Action\": [\"s3:PutObject\",\"s3:GetObject\",\"s3:DeleteObject\",\"s3:GetObjectVersion\"],\"Resource\": \"arn:aws:s3:::my-bucket/home/jdoe/*\"}]}",
+  "HomeDirectoryType": "LOGICAL",
+  "HomeDirectoryDetails": "[{\"Entry\": \"/\", \"Target\": \"/my-bucket/home/jdoe\"}]"
+}
+
+关键字段解释：
+ * Role (必填):
+   * 这是 AWS Transfer Family 用来代表用户访问 S3 的 IAM Role ARN。
+   * 注意： 这个 Role 必须有 Trust Relationship 允许 transfer.amazonaws.com Assume 它。
+ * Policy (选填，但在你的场景中很重要):
+   * 这是一个 JSON 字符串（不是 JSON 对象）。你需要把 Policy JSON 转义成字符串放进去。
+   * 这就是 Scope-Down Policy。它会限制上面的 Role，确保用户只能访问他自己的文件夹。如果不传这个字段，用户就拥有 Role 定义的所有权限。
+ * HomeDirectoryType & HomeDirectoryDetails:
+   * 用于构建 逻辑目录 (Chroot)。
+   * Entry: "/" 表示用户登录 SFTP 后看到的根目录。
+   * Target: "/my-bucket/home/jdoe" 是 S3 的实际物理路径。
+   * 如果不使用逻辑目录，可以直接用 "HomeDirectory": "/my-bucket/home/jdoe"，但那样用户能看到 S3 的 Bucket 名称，不推荐。
+3. 失败响应 (Failure Response)
+场景： 密码错误，或者 OAuth Token 获取失败。
+HTTP 响应示例
+AWS Transfer Family 只看 HTTP Status Code。
+ * Status Code: 403 Forbidden (或者 401 Unauthorized，但 AWS 推荐 403)
+ * Body: 空 (AWS 会忽略 Body 内容)
+<!-- end list -->
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+
+{}
+
+4. 特殊情况：公钥认证 (Public Key Auth)
+如果用户是通过 SSH Key 登录而不是密码：
+ * 请求变动： Header 中没有 Password。
+ * 响应变动： 不需要返回 Role 和 Policy 立即给 AWS，而是返回一个公钥列表，让 AWS 自己去比对。或者你自己在 Lambda 里比对完，直接返回 Role (如果是 API Gateway 方法，通常是后者)。
+但基于你之前的描述（通过 OAuth 换 Token），你走的是 Password Auth 流程，所以请忽略公钥情况，专注于处理 Password Header 即可。
