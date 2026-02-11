@@ -168,3 +168,76 @@ graph TD
     Finalizer -- Yes --> TenantCleanup[Trigger Tenant Cleanup]
     Finalizer -- No --> Notify[Notify Service Deletion Only]
 
+
+
+这两个问题都非常切中要害，触及了分布式系统设计的核心：吞吐量 vs. 延迟 (Throughput vs. Latency) 以及 状态关联 (State Correlation)。
+问题 1：关于“收集一堆请求，打包发给 Airflow” (Batching)
+答案是：可以，但作为 Senior SDE，我要提醒你这会引入极大的复杂性（Complexity）和风险。
+通常我们不建议在 Service 层做这种 "Buffering"（缓冲），原因如下：
+为什么“攒一波再发”是个坑？
+ * 延迟不可控 (Unpredictable Latency):
+   * 假设你设置“收集满 10 个”或者“每 5 分钟”发一次。
+   * 如果第 1 个请求来了，第 2 个请求 1 小时后才来，第 1 个用户就白白等了 1 小时。
+ * 部分失败 (Partial Failures) 的噩梦:
+   * 你把 [ServiceA, ServiceB, ServiceC] 打包给 Airflow。
+   * Airflow 删除了 A 和 B，但 C 失败了。
+   * Airflow 返回结果时，你的 Service 如何处理？你必须解析结果，把 A 和 B 标记为成功，C 标记为失败。这比 1:1 的映射要复杂得多。
+ * 有状态服务的风险:
+   * 你的 Service 需要维护一个“待发送列表” (Buffer)。如果你的 Service 突然 Crash 重启了，内存里攒的那几个请求丢了怎么办？
+   * 你得引入 Redis 或 Kafka Streams Windowing 来保证持久化，架构瞬间变重。
+如果非要这么做 (Use Case)
+只有一种情况推荐这样做：Airflow 的启动开销极大，或者下游云厂商 API 有严格的 Rate Limit（例如每秒只能调 1 次 API）。
+设计方案：使用 Kafka 的 Batch Consumer 或 Windowing
+与其在你的 App 里写 List 代码，不如利用 Kafka 的特性。
+Payload 变化 (To Airflow):
+{
+  "batchId": "batch_uuid_100", 
+  "traceId": "trace_999",
+  "payload": {
+    "tenantId": "tenant_12345",
+    "services_to_delete": [
+        {"serviceInstanceId": "srv-001", "type": "s3", "originalRequestId": "req_1"},
+        {"serviceInstanceId": "srv-002", "type": "rds", "originalRequestId": "req_2"}
+    ]
+  }
+}
+
+Airflow 返回 (From Airflow):
+你需要 Airflow 返回详细的每个子任务的状态：
+{
+  "batchId": "batch_uuid_100",
+  "results": [
+      {"originalRequestId": "req_1", "status": "SUCCESS"},
+      {"originalRequestId": "req_2", "status": "FAILED", "error": "Database locked"}
+  ]
+}
+
+我的建议： 除非遇到性能瓶颈，保持 1 个 Request = 1 个 Airflow DAG Run。让 Airflow 去处理并发（Airflow 本身就是个调度器，它擅长同时跑 100 个任务）。
+问题 2：JobId 是怎么来的？干嘛用的？
+这是一个关于 异步系统关联 (Correlation) 的好问题。
+1. 怎么来的？(Origin)
+它是你的 Java App 生成的。
+当你的 Service 收到 Kafka 的 deletion.request 时，第一件事就是生成这个 ID (通常是 UUID)。
+ * 场景: 收到删除 Service A 的请求。
+ * 动作: String jobId = UUID.randomUUID().toString();
+ * 动作: INSERT INTO table (request_id, ...) VALUES (jobId, ...);
+2. 干嘛用的？(Purpose)
+它是一根**“风筝线”**。
+想象一下：你把风筝（任务）放飞到天空（Airflow）了。过了 10 分钟，风筝飞回来了。你得知道飞回来的这个风筝是谁的，该去更新数据库里的哪一行记录。
+没有 JobId 的灾难场景：
+ * App 发出请求：“去删 Service A”。
+ * App 发出请求：“去删 Service B”。
+ * (10分钟后) Airflow 发回一条消息：“我删完了！”
+ * App 懵了：“你删完了谁？是 A 还是 B？”
+JobId 的全生命周期 (Life Cycle):
+ * Generate (Java App): 收到请求 -> 生成 jobId: "abc-123" -> 存入 DB (Status: PENDING)。
+ * Pass (Kafka -> Airflow): 告诉 Airflow：“你干活的时候，把这个牌子 abc-123 挂在脖子上”。
+ * Execute (Airflow): Airflow 执行任务，它并不关心 abc-123 是什么，它只是拿着它。
+ * Return (Airflow -> Kafka): 任务结束，Airflow 发消息：“我干完了，我脖子上的牌子是 abc-123，结果是 SUCCESS”。
+ * Correlate (Java App): App 收到消息 -> 拿出 abc-123 -> 去 DB 查 WHERE request_id = 'abc-123' -> 更新那一行状态为 COMPLETED。
+为什么不用 TraceId？
+ * TraceId (OpenTelemetry): 是给人看的，用于在 Datadog/Jaeger 里查日志，看整个链路调用。
+ * JobId (Business ID): 是给代码用的，是数据库的主键（Primary Key）或关联键，用于程序逻辑判断。
+总结：
+JobId 是你手里捏着的票根。Airflow 演完电影（跑完任务）出来，你得凭票根（JobId）去核销（Update DB）。
+
