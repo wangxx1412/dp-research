@@ -151,3 +151,140 @@ output "web_app_id" {
   value       = aws_transfer_web_app.portal.web_app_id
   description = "Transfer Web App 的 ID"
 }
+
+# ==========================================
+# 1. 基础配置：Provider 和 存储 (S3)
+# ==========================================
+provider "aws" {
+  region = "<需要你修改的变量: 比如 us-east-1>"
+}
+
+resource "aws_s3_bucket" "sftp_storage" {
+  bucket = "<需要你修改的变量: 比如 my-company-sftp-poc-bucket-12345>"
+}
+
+# ==========================================
+# 2. Data Blocks: 动态获取 VPC、子网和安全组
+# ==========================================
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+}
+
+# 获取默认安全组，AWS-IA 模块在 VPC 模式下需要它
+data "aws_security_group" "default" {
+  vpc_id = data.aws_vpc.default.id
+  name   = "default"
+}
+
+# ==========================================
+# 3. 核心：使用 AWS-IA 官方模块创建 SFTP Server
+# ==========================================
+module "transfer_server" {
+  source  = "aws-ia/transfer-family/aws"
+  version = "0.5.0" # 使用最新版本以支持最新特性
+
+  endpoint_type = "VPC"
+  endpoint_details = {
+    vpc_id             = data.aws_vpc.default.id
+    subnet_ids         = data.aws_subnets.default.ids
+    security_group_ids = [data.aws_security_group.default.id]
+  }
+
+  identity_provider = "SERVICE_MANAGED"
+  domain            = "S3"
+  enable_logging    = true # 官方模块的优势：一行代码开启日志并自动创建对应 IAM 角色
+}
+
+# ==========================================
+# 4. 手动资源：IAM Role 和 User 
+# (因为每个 User 的 S3 权限太定制化，通常在模块外定义)
+# ==========================================
+resource "aws_iam_role" "sftp_role" {
+  name = "sftp-transfer-role-poc"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Action = "sts:AssumeRole",
+      Effect = "Allow",
+      Principal = { Service = "transfer.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "sftp_s3_access" {
+  name = "sftp-s3-access-poc"
+  role = aws_iam_role.sftp_role.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action   = ["s3:ListBucket", "s3:GetBucketLocation"]
+        Effect   = "Allow"
+        Resource = aws_s3_bucket.sftp_storage.arn
+      },
+      {
+        Action   = ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:GetObjectVersion"]
+        Effect   = "Allow"
+        Resource = "${aws_s3_bucket.sftp_storage.arn}/*"
+      }
+    ]
+  })
+}
+
+# 创建基于官方模块 Server ID 的用户
+resource "aws_transfer_user" "sftp_user" {
+  # 注意这里引用了 module 的输出
+  server_id      = module.transfer_server.server_id
+  user_name      = "<需要你修改的变量: 比如 testuser>"
+  role           = aws_iam_role.sftp_role.arn
+  home_directory = "/${aws_s3_bucket.sftp_storage.bucket}"
+}
+
+# ==========================================
+# 5. AWS-IA 子模块：Connector (用于向外发文件)
+# ==========================================
+module "transfer_connector" {
+  source  = "aws-ia/transfer-family/aws//modules/transfer-connectors"
+  version = "0.5.0"
+
+  connector_name = "sftp-poc-connector"
+  access_role    = aws_iam_role.sftp_role.arn
+  url            = "sftp://<需要你修改的变量: 外部目标SFTP的URL, 例如 sftp.example.com>"
+  
+  # 如果外部 SFTP 需要密码/密钥，可以在此处传入你预先建好的 Secrets Manager ARN
+  # 如果不需要凭证验证模块，可以注释掉这部分相关的参数
+}
+
+# ==========================================
+# 6. AWS-IA 子模块：Web App (B2B 文件管理门户)
+# ==========================================
+module "transfer_web_app" {
+  source  = "aws-ia/transfer-family/aws//modules/transfer-web-app"
+  version = "0.5.0"
+
+  identity_center_config = {
+    instance_arn = "<需要你修改的变量: 你 AWS 账号中 IAM Identity Center 实例的 ARN>"
+    role         = aws_iam_role.sftp_role.arn
+  }
+}
+
+# ==========================================
+# 7. Outputs
+# ==========================================
+output "transfer_server_id" {
+  value = module.transfer_server.server_id
+}
+
+# 注意：模块可能会以字典或列表形式抛出 endpoint，这里提供最安全的输出方式
+output "transfer_server_endpoint" {
+  value       = module.transfer_server.server_endpoint
+  description = "服务器的 VPC Endpoint"
+}
+
