@@ -1,0 +1,17 @@
+Can Port 22 be changed?
+The short answer is: Yes, but with strict limitations. It entirely depends on how the AWS administrator configured the server.
+As the client writing the Python script, you cannot simply change PORT = 22 to something else in your code and expect it to work. You can only connect to a port that the server is actively listening to.
+Here is the breakdown of when the port can and cannot be changed on the AWS side:
+Scenario A: Public Endpoints (Cannot be changed)
+If the server is exposed directly to the public internet (which is highly likely for the s-c54c...amazonaws.com address in your screenshot), AWS strictly enforces Port 22. The server administrator cannot change it.
+Reasons why it cannot be changed:
+ * Fully Managed Shared Infrastructure: AWS Transfer Family is a managed service. AWS handles the underlying fleets of servers and load balancers that process your connection. Because these public entry points are shared AWS infrastructure, allowing millions of customers to open random custom ports would create a massive routing complexity.
+ * Standardized Security: Port 22 is the globally recognized IANA standard for SSH/SFTP. Sticking exclusively to the default allows AWS to apply universal, automated security protocols and DDoS protection across their public network.
+ * No Custom Firewalls: Public endpoints in Transfer Family do not support custom Security Groups (cloud firewalls). You get exactly what AWS provisions, which is Port 22 only.
+Scenario B: VPC-Hosted Endpoints (Can be changed)
+If the administrator hides the server inside a private corporate network (a Virtual Private Cloud, or VPC), they do have options to change the port.
+ * Native Alternate Ports: AWS allows administrators to natively use ports 2222, 2223, or 22000 instead of 22 for VPC endpoints.
+ * Any Custom Port (e.g., 8022): If a company insists on using a completely random port, the admin must place a Network Load Balancer (NLB) in front of the SFTP server. The NLB will listen to the custom port on the outside, and silently forward the traffic to Port 22 on the inside.
+The Bottom Line for Your Code:
+If your Jupyter Notebook is timing out on PORT = 22, changing that number in your code won't fix the issue unless the server admin explicitly told you to use a different port. Your timeout is almost certainly an IP whitelist issue (your IP is blocked), not a port issue.
+Would you like me to show you a quick command-line trick to scan this AWS address and see if they happen to have ports like 2222 or 22000 open?
