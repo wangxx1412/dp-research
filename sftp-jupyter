@@ -54,3 +54,35 @@ for item in sftp_client.listdir():
  * 拥有有效的 SSH 私钥：代码中的 PRIVATE_KEY_PATH 指向了原作者电脑里的一个私钥文件（transfer-key）。服务器只有验证了这个密钥，才会允许连接。
 如果你有自己的 SFTP 服务器和密钥，只需要把 Cell 1 里面的变量替换成你自己的信息，就可以完美运行了。
 你需要我为你解释一下 paramiko 这个库的具体工作原理，或者教你如何生成 SSH 密钥吗？
+
+没问题！既然在第三个 cell 中已经看到了 news_source_checked.csv 这个文件，接下来的第四个 cell 我们就来测试把它下载到你的本地电脑上。
+在 paramiko 中，下载文件非常简单，使用的是 sftp_client.get(远程路径, 本地路径) 这个方法。
+你可以直接在你的 Jupyter Notebook 中添加下面这个全新的 Cell 4：
+import os
+
+# 1. 指定你要下载的文件名（从你在 Cell 3 看到的结果中提取）
+file_to_download = "news_source_checked.csv"
+
+# 2. 拼接完整的远程路径和本地路径
+# 注意：这里使用了你在 Cell 1 定义的 REMOTE_FILE_PATH 和 LOCAL_DOWNLOAD_PATH
+remote_file = f"{REMOTE_FILE_PATH}/{file_to_download}"
+local_file = f"{LOCAL_DOWNLOAD_PATH}/{file_to_download}"
+
+# 3. (可选但推荐) 确保你本地的下载文件夹已经存在，如果不存在就自动创建
+os.makedirs(LOCAL_DOWNLOAD_PATH, exist_ok=True)
+
+print(f"Preparing to download:\nFrom: {remote_file}\nTo:   {local_file}\n...")
+
+# 4. 执行下载
+try:
+    sftp_client.get(remote_file, local_file)
+    print("✅ Download completed successfully! 去你的本地文件夹看看吧。")
+except Exception as e:
+    print(f"❌ Download failed. Error: {e}")
+
+💡 这段代码做了什么：
+ * 智能路径拼接： 它把你第一步设置的 REMOTE_FILE_PATH（/home/a2-wang）和文件名拼接在一起，告诉服务器去哪里找文件。本地路径同理。
+ * 防错机制： 加入了 os.makedirs。如果你的电脑上还没有 /Users/a2.wang/code/data-platform-data-tool/out 这个文件夹，它会自动帮你建好，防止下载时因为找不到文件夹而报错。
+ * 容错处理 (try...except)： 如果因为网络断开或者权限不足导致下载失败，它会打印出具体的错误原因，而不是直接让整个 Notebook 崩溃。
+注意： 运行这个 Cell 之前，你必须确保前面的 Cell 1 和 Cell 2 已经成功运行（即已经成功建立了 SFTP 连接，没有再报 Timeout 错误）。
+需要我再给你加一个 Cell 5，教你测试完之后如何安全地关闭 SFTP 连接吗？（如果不关闭，后台可能会一直占用服务器资源哦）
